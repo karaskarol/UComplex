@@ -1,0 +1,16 @@
+{
+  "Enable": true,
+  "IncludeDrivers": true,
+  "AutoReboot": false,
+  "Winget": {
+    "UpgradeAll": true,
+    "Silent": true
+  },
+  "Vendors": {
+    "HP": true,
+    "Dell": true
+  },
+  "Schedule": {
+    "EveryHours": 12
+  }
+}
