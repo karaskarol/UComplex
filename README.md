@@ -1,4 +1,7 @@
+ bm6yhu-codex/add-brand-check-for-computer-manufacturers
+=======
  kgjdbc-codex/add-brand-check-for-computer-manufacturers
+ main
 # UComplex — uniwersalny post-install i aktualizator Windows (AD i non-AD)
 
 ## Funkcje (MVP)
@@ -18,7 +21,11 @@
 
 ## Szybki start
 ```powershell
+ bm6yhu-codex/add-brand-check-for-computer-manufacturers
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/karaskarol/UComplex/h6xjo9-codex/add-brand-check-for-computer-manufacturers/bootstrap.ps1 | iex"
+=======
 iex (irm https://raw.githubusercontent.com/karaskarol/UComplex/main/bootstrap.ps1)
+main
 ```
 
 ## Tryb offline
@@ -51,6 +58,8 @@ Uruchom `UComplex_Offline.ps1` z lokalnego katalogu.
 - Działa w domenie i poza nią
 - Tryb offline równoważny online
 - Brak twardych zależności od zasobów AD
+bm6yhu-codex/add-brand-check-for-computer-manufacturers
+=======
 =======
 # UComplex
 
