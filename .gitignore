@@ -1,0 +1,7 @@
+logs/
+bin/
+drivers/
+packages/
+*.zip
+*.log
+*.bak
