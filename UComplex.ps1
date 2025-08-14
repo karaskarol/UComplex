@@ -1,333 +1,264 @@
 <#
-    UComplex.ps1
-    Skrypt PowerShell 7 automatyzujący przygotowanie "zaniedbanego" komputera
-    z Windows 10/11 x64 do podłączenia do firmowej sieci.
-
-    Funkcje:
-      DetectDomainParams  – wykrywa parametry domeny (suffix DNS, kontrolery, OU)
-      DomainJoin          – dołącza komputer do domeny AD z retry policy
-      UpdateOS            – aktualizacja systemu (Windows Update / winget)
-      UpdateDrivers       – aktualizacja sterowników (vendor tools + PnPUtil)
-      UpdateApps          – aktualizacja aplikacji kluczowych przez winget
-      SyncPolicy          – synchronizacja plików polityk z serwera firmowego
-      VerifyCompliance    – weryfikacja zgodności (zapora, UAC)
-      RemediateCompliance – naprawa wykrytych niezgodności
-      CreateScheduledTask – zadanie cykliczne uruchamiające powyższe funkcje
-
-    Wymagania: PowerShell 7, .NET 5+, uprawnienia administratora, łączność sieciowa.
+  Win11_Update_Orchestrator_final.ps1 — PowerShell 5.1
+  Zmiany vs poprzednie:
+   • Restart TYLKO gdy w tym cyklu coś zainstalowano ORAZ jest wymagany/pending restart.
+   • Odliczanie do restartu (domyślnie 60 s) z paskiem postępu.
+   • Odporne na uruchomienie „z wklejki” (bez ścieżki pliku) — AutoResume wtedy wyłączone.
+   • PS 5.1 kompatybilny (bez operatora '??').
 #>
 
-Set-StrictMode -Version Latest
+[CmdletBinding()]
+param(
+  [switch]$Continue,
+  [switch]$NoReboot
+)
 
-#region Logging
-$LogDir = 'C:\ProgramData\UComplex\logs'
-if (-not (Test-Path $LogDir)) {
-    New-Item -Path $LogDir -ItemType Directory -Force | Out-Null
+# ----------------------------- USTAWIENIA -----------------------------------
+$Config = [ordered]@{
+  UseMicrosoftUpdate        = $true   # Rejestruj Microsoft Update (Office/.NET itp.)
+  IncludeDrivers            = $true   # Aktualizacje sterowników
+  UpdateWinget              = $true   # winget upgrade --all
+  UpdateDefender            = $true   # Update-MpSignature / MpCmdRun
+  CleanupComponents         = $true   # DISM StartComponentCleanup
+  AutoReboot                = $true   # Automatyczny restart, jeśli wymagany
+  AutoResume                = $true   # Wznowienie po restarcie (Harmonogram jako SYSTEM)
+  RestartCountdownSeconds   = 60      # Odliczanie przed restartem
+  MaxCycles                 = 3
+  TaskName                  = 'Win11-Update-Resume'
+  TaskDelay                 = 'PT45S'
+  StableHome                = 'C:\ProgramData\Win11-Update'
 }
 
-function Write-Log {
-    param([string]$Message)
-    $time    = Get-Date
-    $line    = "{0:s} {1}" -f $time, $Message
-    $textLog = Join-Path $LogDir 'update.log'
-    $jsonLog = Join-Path $LogDir 'update.json'
+# ---------------------------- POMOCNICZE ------------------------------------
+function Write-Info($msg){ Write-Host "[INFO] $msg" }
+function Write-Warn($msg){ Write-Warning $msg }
 
-    Add-Content -Path $textLog -Value $line
-    ($line | ConvertTo-Json -Compress) | Add-Content -Path $jsonLog
+function Test-Admin {
+  $wi = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $wp = New-Object Security.Principal.WindowsPrincipal($wi)
+  return $wp.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
 
-    foreach ($p in @($textLog, $jsonLog)) {
-        if ((Test-Path $p) -and ((Get-Item $p).Length -gt 50MB)) {
-            Rename-Item $p "$p.old" -Force
-        }
+function Ensure-Admin {
+  if (-not (Test-Admin)) {
+    Write-Warn "Brak uprawnień Administratora – podnoszę uprawnienia..."
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $args = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$($MyInvocation.MyCommand.Path)`"")
+    if ($Continue) { $args += '-Continue' }
+    if ($NoReboot) { $args += '-NoReboot' }
+    $psi.Arguments = $args -join ' '
+    $psi.Verb = 'runas'
+    [Diagnostics.Process]::Start($psi) | Out-Null
+    exit
+  }
+}
+
+function Start-Logging {
+  $global:LogRoot = Join-Path $env:SystemRoot 'Logs\Win11-Update'
+  New-Item -Path $LogRoot -ItemType Directory -Force | Out-Null
+  $global:LogTime = Get-Date -Format 'yyyyMMdd_HHmmss'
+  $global:LogFile = Join-Path $LogRoot "Run_$LogTime.log"
+  try { Start-Transcript -Path $LogFile -Append -ErrorAction Stop } catch {}
+  Write-Info "Log: $LogFile"
+}
+
+function Stop-Logging { try { Stop-Transcript | Out-Null } catch {} }
+
+function Ensure-StableHome {
+  if (-not $Config.AutoResume) { return }
+  # Ustal ścieżkę pliku skryptu. Gdy uruchomiono z wklejki – będzie pusto.
+  $scriptPath = $PSCommandPath
+  if ([string]::IsNullOrEmpty($scriptPath)) { $scriptPath = $MyInvocation.MyCommand.Path }
+  if ([string]::IsNullOrEmpty($scriptPath) -or -not (Test-Path $scriptPath)) {
+    Write-Info "Uruchomienie bez pliku – AutoResume wyłączone."
+    $Config.AutoResume = $false
+    return
+  }
+  $targetDir = $Config.StableHome
+  $target    = Join-Path $targetDir (Split-Path $scriptPath -Leaf)
+  if (-not (Test-Path $targetDir)) { New-Item -Path $targetDir -ItemType Directory -Force | Out-Null }
+  if ($scriptPath -ne $target) {
+    Write-Info "Kopiuję skrypt do: $target"
+    Copy-Item -LiteralPath $scriptPath -Destination $target -Force
+    Write-Info "Ponowne uruchomienie z lokalizacji docelowej..."
+    $args = @('-NoProfile','-ExecutionPolicy','Bypass','-File',"`"$target`"")
+    if ($Continue) { $args += '-Continue' }
+    if ($NoReboot) { $args += '-NoReboot' }
+    Start-Process powershell -Verb RunAs -ArgumentList $args
+    exit
+  }
+}
+
+function Enable-MicrosoftUpdate {
+  if (-not $Config.UseMicrosoftUpdate) { return }
+  try {
+    Write-Info 'Rejestracja usługi Microsoft Update...'
+    $sm = New-Object -ComObject Microsoft.Update.ServiceManager
+    $null = $sm.AddService2('7971f918-a847-4430-9279-4a52d1efe18d',7,'')
+    Write-Info 'Microsoft Update: OK'
+  } catch { Write-Warn "Nie udało się włączyć Microsoft Update: $($_.Exception.Message)" }
+}
+
+function New-UpdateSearcher {
+  $session = New-Object -ComObject Microsoft.Update.Session
+  $session.ClientApplicationID = 'Win11_Update_Orchestrator'
+  return $session.CreateUpdateSearcher()
+}
+
+function Install-UpdatesByCriteria {
+  param(
+    [Parameter(Mandatory)] [string]$Criteria,
+    [string]$Label
+  )
+  if ([string]::IsNullOrEmpty($Label)) { $Label = $Criteria }
+  Write-Info "Wyszukiwanie: $Label"
+  $searcher = New-UpdateSearcher
+  $result = $searcher.Search($Criteria)
+  if ($result.Updates.Count -le 0) {
+    Write-Info "Brak aktualizacji dla: $Label"
+    return @{ Installed=$false; RebootRequired=$false; Count=0 }
+  }
+  $updatesToInstall = New-Object -ComObject Microsoft.Update.UpdateColl
+  for ($i=0; $i -lt $result.Updates.Count; $i++) {
+    $upd = $result.Updates.Item($i)
+    try { if (-not $upd.EulaAccepted) { $upd.AcceptEula() } } catch {}
+    $null = $updatesToInstall.Add($upd)
+    Write-Info ("  + {0}" -f $upd.Title)
+  }
+  if ($updatesToInstall.Count -eq 0) { return @{ Installed=$false; RebootRequired=$false; Count=0 } }
+  Write-Info ("Instalacja {0} aktualizacji ({1})..." -f $updatesToInstall.Count, $Label)
+  $session   = New-Object -ComObject Microsoft.Update.Session
+  $installer = $session.CreateUpdateInstaller()
+  $installer.Updates = $updatesToInstall
+  $instResult = $installer.Install()
+  $reboot = $false
+  try { $reboot = [bool]$instResult.RebootRequired } catch {}
+  Write-Info ("Wynik: HResult={0}; Restart={1}" -f $instResult.HResult, $reboot)
+  return @{ Installed=$true; RebootRequired=$reboot; Count=$updatesToInstall.Count }
+}
+
+function Test-PendingReboot {
+  $keys = @(
+    'HKLM:SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+    'HKLM:SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+  )
+  foreach ($k in $keys) { if (Test-Path $k) { return $true } }
+  $pfro = Get-ItemProperty -Path 'HKLM:SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+  if ($pfro) { return $true }
+  return $false
+}
+
+function Ensure-ResumeTask {
+  if (-not $Config.AutoResume) { return }
+  $existing = Get-ScheduledTask -TaskName $Config.TaskName -ErrorAction SilentlyContinue
+  if ($existing) { return }
+  Write-Info "Tworzenie zadania wznowienia: $($Config.TaskName)"
+  $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$($MyInvocation.MyCommand.Path)`" -Continue"
+  $trigger   = New-ScheduledTaskTrigger -AtStartup -Delay $Config.TaskDelay
+  $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest -LogonType ServiceAccount
+  Register-ScheduledTask -TaskName $Config.TaskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+}
+
+function Remove-ResumeTask {
+  $t = Get-ScheduledTask -TaskName $Config.TaskName -ErrorAction SilentlyContinue
+  if ($t) { try { Unregister-ScheduledTask -TaskName $Config.TaskName -Confirm:$false | Out-Null } catch {} }
+}
+
+function Update-WingetApps {
+  if (-not $Config.UpdateWinget) { return }
+  $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+  if (-not $winget) { Write-Warn 'winget.exe nie znaleziony – pomijam aktualizację aplikacji.'; return }
+  Write-Info 'Aktualizacja źródeł winget...'
+  & $winget source update | Out-Host
+  Write-Info 'Aktualizacja aplikacji przez winget (może potrwać)...'
+  & $winget upgrade --all --silent --accept-package-agreements --accept-source-agreements --include-unknown | Out-Host
+}
+
+function Update-Defender {
+  if (-not $Config.UpdateDefender) { return }
+  try {
+    if (Get-Command Update-MpSignature -ErrorAction SilentlyContinue) {
+      Write-Info 'Microsoft Defender – aktualizacja sygnatur...'
+      Update-MpSignature -AsJob | Wait-Job | Out-Null
+    } else {
+      $alt = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
+      if (Test-Path $alt) { Write-Info 'Microsoft Defender – MpCmdRun...'; & $alt -SignatureUpdate | Out-Host }
     }
+  } catch { Write-Warn "Defender update błąd: $($_.Exception.Message)" }
+}
 
-    if (-not [System.Diagnostics.EventLog]::SourceExists('UComplex')) {
-        New-EventLog -LogName Application -Source 'UComplex'
+function Cleanup-Components {
+  if (-not $Config.CleanupComponents) { return }
+  Write-Info 'DISM StartComponentCleanup...'
+  Start-Process -FilePath dism.exe -ArgumentList '/Online','/Cleanup-Image','/StartComponentCleanup','/Quiet' -Wait -NoNewWindow
+}
+
+# ----------------------------- PRZEBIEG -------------------------------------
+Ensure-Admin
+Ensure-StableHome
+Start-Logging
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+Write-Info "Windows: $([Environment]::OSVersion.VersionString)"
+Write-Info "Start: $(Get-Date)"
+
+Enable-MicrosoftUpdate
+
+# Główna pętla
+$cycle = 0
+$global:WasRebootRequired = $false
+
+while ($cycle -lt [int]$Config.MaxCycles) {
+  $cycle++
+  Write-Host "`n==== CYKL $cycle / $($Config.MaxCycles) ====" -ForegroundColor Cyan
+
+  $rSoft = Install-UpdatesByCriteria -Criteria "IsInstalled=0 and Type='Software'" -Label 'Software'
+  $global:WasRebootRequired = $global:WasRebootRequired -or [bool]$rSoft.RebootRequired
+
+  $rDrv = $null
+  if ($Config.IncludeDrivers) {
+    $rDrv = Install-UpdatesByCriteria -Criteria "IsInstalled=0 and Type='Driver'" -Label 'Drivers'
+    $global:WasRebootRequired = $global:WasRebootRequired -or [bool]$rDrv.RebootRequired
+  }
+
+  $installedDrv = ($null -ne $rDrv) -and [bool]$rDrv.Installed
+  $anything     = [bool]$rSoft.Installed -or $installedDrv
+
+  $pending = Test-PendingReboot
+  # *** Kluczowa zmiana: restart tylko jeśli COŚ zainstalowano w tym cyklu i wymagany/pending jest restart
+  $needReboot = ($anything -and ($global:WasRebootRequired -or $pending))
+
+  if ($needReboot) {
+    $sec = [int]$Config.RestartCountdownSeconds
+    if ($sec -lt 5) { $sec = 5 }
+    Write-Host "Restart wymagany. System zrestartuje się za $sec s..." -ForegroundColor Yellow
+    if ($Config.AutoReboot -and -not $NoReboot) {
+      if ($Config.AutoResume) { Ensure-ResumeTask }
+      $msg = "Windows Update zakończone. Restart nastąpi za $sec s. Zapisz pracę."
+      try { Stop-Logging } catch {}
+      Start-Process -FilePath shutdown.exe -ArgumentList '/r','/t',$sec,'/c',$msg -WindowStyle Hidden
+      for ($s = $sec; $s -gt 0; $s--) {
+        $pct = [int](((($sec - $s) / [double]$sec) * 100))
+        Write-Progress -Activity 'Restart systemu' -Status ("$s s do restartu") -PercentComplete $pct
+        Start-Sleep -Seconds 1
+      }
+      return
+    } else {
+      Write-Warn 'AutoReboot=FALSE lub -NoReboot – restart pominięty. Zrestartuj ręcznie, aby dokończyć aktualizacje.'
+      break
     }
-    Write-EventLog -LogName Application -Source 'UComplex' -EventId 1000 -EntryType Information -Message $Message
-}
-#endregion Logging
+  }
 
-if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)) {
-    Write-Error 'Uruchom skrypt jako Administrator.'
-    exit 1
+  if (-not $anything) { Write-Info 'Brak kolejnych aktualizacji. Koniec pętli.'; break }
 }
 
-#region DetectDomainParams
-function DetectDomainParams {
-    Write-Log '=== DetectDomainParams START ==='
-    $params = [ordered]@{ Domain=$null; OU=$null; DomainControllers=@() }
-    try {
-        $suffix = (Get-DnsClient | Where-Object { $_.ConnectionSpecificSuffix }).ConnectionSpecificSuffix | Select-Object -First 1
-        if ($suffix) {
-            $records = Resolve-DnsName -Type SRV -Name "_ldap._tcp.dc._msdcs.$suffix" -ErrorAction Stop
-            $params.DomainControllers = $records | Select-Object -ExpandProperty NameTarget -Unique
-            if ($params.DomainControllers) {
-                try {
-                    $root = Get-ADRootDSE -Server $params.DomainControllers[0] -ErrorAction Stop
-                    $params.Domain = $root.defaultNamingContext
-                    $params.OU     = $root.defaultNamingContext
-                } catch { Write-Log "[Domain] Brak AD module: $($_.Exception.Message)" }
-            }
-        }
-    } catch { Write-Log "[Domain][ERROR] $($_.Exception.Message)" }
-
-    if (-not $params.Domain) {
-        $params.Domain = 'corp.example.com'
-        $params.OU     = 'OU=Clients,DC=corp,DC=example,DC=com'
-    }
-    Write-Log "[Domain] Domain=$($params.Domain); OU=$($params.OU)"
-    Write-Log '=== DetectDomainParams END ==='
-    return [pscustomobject]$params
+# Post-steps tylko jeśli nie czeka restart
+if (-not (Test-PendingReboot)) {
+  Update-WingetApps
+  Update-Defender
+  Cleanup-Components
+  Remove-ResumeTask
 }
-#endregion DetectDomainParams
 
-#region DomainJoin
-function DomainJoin {
-    param([pscustomobject]$Params)
-    Write-Log '=== DomainJoin START ==='
-    $cs = Get-CimInstance Win32_ComputerSystem
-    if ($cs.PartOfDomain) {
-        Write-Log "[Domain] Komputer już w domenie $($cs.Domain)"
-        Write-Log '=== DomainJoin END ==='
-        return
-    }
-
-    $cred = Get-Credential -Message 'Podaj poświadczenia domenowe'
-    for ($i=1; $i -le 3; $i++) {
-        try {
-            Add-Computer -DomainName $Params.Domain -OUPath $Params.OU -Credential $cred -ErrorAction Stop
-            Write-Log '[Domain] Dołączono do domeny.'
-            $joined = $true
-            break
-        } catch {
-            Write-Log "[Domain][ERROR] Próba ${i}: $($_.Exception.Message)"
-            Start-Sleep -Seconds (300 + (300 * ($i-1)))
-        }
-    }
-    if (-not $joined) { Write-Log '[Domain][ERROR] Nie udało się dołączyć do domeny.' }
-    Write-Log '=== DomainJoin END ==='
-}
-#endregion DomainJoin
-
-#region UpdateOS
-function UpdateOS {
-    Write-Log '=== UpdateOS START ==='
-    for ($i=1; $i -le 2; $i++) {
-        try {
-            if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
-                Install-Module -Name PSWindowsUpdate -Force -Confirm:$false -ErrorAction Stop
-            }
-            Import-Module PSWindowsUpdate -ErrorAction Stop
-            Install-WindowsUpdate -AcceptAll -IgnoreReboot -ErrorAction Stop
-            winget upgrade --all --accept-source-agreements --silent
-            $ok = $true
-            break
-        } catch {
-            Write-Log "[UpdateOS][ERROR] Próba ${i}: $($_.Exception.Message)"
-            Start-Sleep -Seconds 30
-        }
-    }
-    if (-not $ok) { Write-Log '[UpdateOS] Aktualizacja systemu nie powiodła się.' }
-    Write-Log '=== UpdateOS END ==='
-}
-#endregion UpdateOS
-
-#region UpdateDrivers
-function UpdateDrivers {
-    Write-Log '=== UpdateDrivers START ==='
-    try {
-        $manufacturer = (Get-WmiObject Win32_ComputerSystem).Manufacturer
-        Write-Log "[Driver] Producent: $manufacturer"
-        switch -Regex ($manufacturer) {
-            'Dell' {
-                if (-not (Get-Command 'dcu-cli.exe' -ErrorAction SilentlyContinue)) {
-                    winget install -e --id Dell.CommandUpdate -h > $null 2>&1
-                }
-                for ($i=1; $i -le 2; $i++) {
-                    if (Get-Command 'dcu-cli.exe' -ErrorAction SilentlyContinue) {
-                        Start-Process 'dcu-cli.exe' -ArgumentList '/silent /update' -Wait
-                    }
-                }
-            }
-            'HP|Hewlett-Packard' {
-                if (-not (Get-Command 'HPIA.exe' -ErrorAction SilentlyContinue)) {
-                    winget install -e --id HP.ImageAssistant -h > $null 2>&1
-                }
-                for ($i=1; $i -le 2; $i++) {
-                    if (Get-Command 'HPIA.exe' -ErrorAction SilentlyContinue) {
-                        Start-Process 'HPIA.exe' -ArgumentList '/Silent /Update' -Wait
-                    }
-                }
-            }
-            'Lenovo' {
-                if (-not (Get-Command 'tvsu.exe' -ErrorAction SilentlyContinue)) {
-                    winget install -e --id Lenovo.SystemUpdate -h > $null 2>&1
-                }
-                for ($i=1; $i -le 2; $i++) {
-                    if (Get-Command 'tvsu.exe' -ErrorAction SilentlyContinue) {
-                        Start-Process 'tvsu.exe' -ArgumentList '/CM -search A -action INSTALL -silent' -Wait
-                    }
-                }
-            }
-            'MSI' {
-                if (-not (Get-Command 'MSI.exe' -ErrorAction SilentlyContinue)) {
-                    winget install -e --id Micro-StarInternational.LiveUpdate -h > $null 2>&1
-                }
-                for ($i=1; $i -le 2; $i++) {
-                    if (Get-Command 'MSI.exe' -ErrorAction SilentlyContinue) {
-                        Start-Process 'MSI.exe' -ArgumentList '/silent /update' -Wait
-                    }
-                }
-            }
-            'Gigabyte|Gigabite' {
-                if (-not (Get-Command 'gigabyte.exe' -ErrorAction SilentlyContinue)) {
-                    winget install -e --id GIGABYTE.AppCenter -h > $null 2>&1
-                }
-                for ($i=1; $i -le 2; $i++) {
-                    if (Get-Command 'gigabyte.exe' -ErrorAction SilentlyContinue) {
-                        Start-Process 'gigabyte.exe' -ArgumentList '/update /silent' -Wait
-                    }
-                }
-            }
-            default { Write-Log "[Driver] Producent '$manufacturer' nieobsługiwany." }
-        }
-    } catch { Write-Log "[Driver][ERROR] $($_.Exception.Message)" }
-
-    # PnPUtil fallback
-    for ($i=1; $i -le 2; $i++) {
-        try {
-            pnputil /scan-devices
-            $pnpu = $true
-            break
-        } catch {
-            Write-Log "[Driver][PnPUtil][ERROR] Próba ${i}: $($_.Exception.Message)"
-            Start-Sleep -Seconds 15
-        }
-    }
-    if (-not $pnpu) { Write-Log '[Driver][PnPUtil] Nie udało się przeskanować urządzeń.' }
-    Write-Log '=== UpdateDrivers END ==='
-}
-#endregion UpdateDrivers
-
-#region UpdateApps
-function UpdateApps {
-    Write-Log '=== UpdateApps START ==='
-    $apps = @('Microsoft.Office','Google.Chrome','7zip.7zip')
-    foreach ($app in $apps) {
-        for ($i=1; $i -le 2; $i++) {
-            try {
-                winget upgrade --id $app --silent --accept-source-agreements
-                break
-            } catch {
-                Write-Log "[Apps][ERROR] $app próba ${i}: $($_.Exception.Message)"
-                Start-Sleep -Seconds 10
-            }
-        }
-    }
-    Write-Log '=== UpdateApps END ==='
-}
-#endregion UpdateApps
-
-#region SyncPolicy
-function SyncPolicy {
-    param(
-        [string]$Source      = '\\Server\CompanyPolicies',
-        [string]$Destination = 'C:\CompanyPolicies',
-        [PSCredential]$Credential
-    )
-    Write-Log '=== SyncPolicy START ==='
-    $success = $false
-    try {
-        $srv = ($Source -split '\\')[2]
-        if (-not (Test-Connection $srv -Count 1 -Quiet)) { throw "Serwer $srv nieosiągalny" }
-        if ($Credential) {
-            New-PSDrive -Name 'Z' -PSProvider FileSystem -Root $Source -Credential $Credential -ErrorAction Stop | Out-Null
-            $src = 'Z:\'
-        } else { $src = $Source }
-        if (-not (Test-Path $Destination)) { New-Item -Path $Destination -ItemType Directory -Force | Out-Null }
-        robocopy $src $Destination /MIR /FFT /Z /XA:H /W:5 /R:2 | Out-Null
-        if ($LASTEXITCODE -lt 8) { $success = $true }
-    } catch { Write-Log "[Sync][ERROR] $($_.Exception.Message)" }
-    if ($Credential) { Remove-PSDrive -Name 'Z' -Force -ErrorAction SilentlyContinue }
-    if ($success) { Write-Log '[Sync] Sukces.' } else { Write-Log '[Sync] Błąd synchronizacji.' }
-    Write-Log '=== SyncPolicy END ==='
-    return $success
-}
-#endregion SyncPolicy
-
-#region VerifyCompliance
-function VerifyCompliance {
-    Write-Log '=== VerifyCompliance START ==='
-    $issues = @()
-    try {
-        if (Get-Command Get-NetFirewallProfile -ErrorAction SilentlyContinue) {
-            Get-NetFirewallProfile | ForEach-Object { if (-not $_.Enabled) { $issues += "FW:$($_.Name)" } }
-        } else {
-            $fw = (netsh firewall show state | Select-String 'Mode').ToString()
-            if ($fw -match 'Disabled') { $issues += 'FW:Legacy' }
-        }
-        $uac = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name EnableLUA -ErrorAction SilentlyContinue).EnableLUA
-        if ($uac -ne 1) { $issues += 'UAC' }
-    } catch { Write-Log "[Verify][ERROR] $($_.Exception.Message)" }
-    if ($issues.Count) { foreach ($i in $issues) { Write-Log "[Verify] $i" } } else { Write-Log '[Verify] OK' }
-    Write-Log '=== VerifyCompliance END ==='
-    return $issues
-}
-#endregion VerifyCompliance
-
-#region RemediateCompliance
-function RemediateCompliance {
-    param([string[]]$Issues)
-    Write-Log '=== RemediateCompliance START ==='
-    foreach ($i in $Issues) {
-        if ($i -like 'FW:*') {
-            if (Get-Command Set-NetFirewallProfile -ErrorAction SilentlyContinue) {
-                Set-NetFirewallProfile -Name * -Enabled True -ErrorAction SilentlyContinue
-            } else {
-                netsh firewall set opmode mode=ENABLE | Out-Null
-            }
-            Write-Log '[Remediate] Zapora włączona.'
-        }
-        if ($i -eq 'UAC') {
-            Set-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name EnableLUA -Value 1 -ErrorAction SilentlyContinue
-            Write-Log '[Remediate] UAC włączone.'
-        }
-    }
-    Write-Log '=== RemediateCompliance END ==='
-}
-#endregion RemediateCompliance
-
-#region CreateScheduledTask
-function CreateScheduledTask {
-    Write-Log '=== CreateScheduledTask START ==='
-    $action = New-ScheduledTaskAction -Execute 'pwsh.exe' -Argument "-File `"$PSCommandPath`""
-    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Hours 12) -RepeatIndefinitely
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
-    Register-ScheduledTask -TaskName 'UComplexUpdate' -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
-    Write-Log '=== CreateScheduledTask END ==='
-}
-#endregion CreateScheduledTask
-
-#region Main
-try {
-    $domainParams = DetectDomainParams
-    DomainJoin -Params $domainParams
-    UpdateOS
-    UpdateDrivers
-    UpdateApps
-    if (SyncPolicy) {
-        $issues = VerifyCompliance
-        if ($issues.Count) {
-            RemediateCompliance -Issues $issues
-            VerifyCompliance
-        }
-    }
-    CreateScheduledTask
-    Write-Log 'UComplex zakończył działanie.'
-} catch {
-    Write-Log "[MAIN][ERROR] $($_.Exception.Message)"
-    exit 1
-}
-#endregion Main
-
+Write-Info "Koniec: $(Get-Date)"
+Stop-Logging
